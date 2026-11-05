@@ -1,0 +1,5 @@
+*.jar
+*.mca
+*.log
+**/orebound-ru-backups/
+test-output/

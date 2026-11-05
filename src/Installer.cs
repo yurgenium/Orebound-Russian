@@ -10,10 +10,14 @@ using System.Diagnostics;
 using System.Windows.Forms;
 using System.Web.Script.Serialization;
 using System.Runtime.InteropServices;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Drawing.Drawing2D;
 
 // Windows/.NET Framework 4.8. No network, elevation or third-party runtime.
 public static class OreboundRu {
     [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
+    [DllImport("kernel32.dll")] static extern uint GetConsoleProcessList([Out] uint[] processes,uint count);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr window,int command);
     static readonly UTF8Encoding Utf8 = new UTF8Encoding(false, true);
     static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 20000000 };
@@ -35,10 +39,10 @@ public static class OreboundRu {
         if(!p.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar)+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase)) throw new Exception("Путь выходит за пределы сборки.");
         return p;
     }
-    static void Closed() { if(Process.GetProcessesByName("java").Length+Process.GetProcessesByName("javaw").Length>0) throw new Exception("Сначала закрой Minecraft и другие приложения Java, затем повтори установку."); }
+    static void Closed() { if(Process.GetProcessesByName("java").Length+Process.GetProcessesByName("javaw").Length>0) throw new Exception("Сначала закройте Minecraft и другие приложения Java, затем повторите установку."); }
     static string Base(string path) {
         string root=Path.GetFullPath(path.Trim().Trim('"')).TrimEnd(Path.DirectorySeparatorChar);
-        if(!Directory.Exists(Path.Combine(root,"mods")) || !Directory.Exists(Path.Combine(root,"config","ftbquests","quests"))) throw new Exception("Выбери папку сборки OREBOUND: в ней должны находиться папки mods и config.");
+        if(!Directory.Exists(Path.Combine(root,"mods")) || !Directory.Exists(Path.Combine(root,"config","ftbquests","quests"))) throw new Exception("Выберите папку сборки OREBOUND: в ней должны находиться папки mods и config.");
         string en=SafePath(root,"config/ftbquests/quests/lang/en_us.snbt");
         if(!File.Exists(en) || Hash(File.ReadAllBytes(en))!=Str(Data,"quest_source_sha256")) throw new Exception("Квесты отличаются от поддерживаемой OREBOUND 0.2.2. Файлы не изменены.");
         return root;
@@ -107,9 +111,30 @@ public static class OreboundRu {
             }
         }
     }
+    public static byte[] PatchImage(byte[] source,Dictionary<string,object> definition) {
+        using(var input=new MemoryStream(source))using(var original=Image.FromStream(input)) {
+            int width=Convert.ToInt32(definition["width"]),height=Convert.ToInt32(definition["height"]);
+            if(original.Width!=width || original.Height!=height)throw new Exception("Размер изображения отличается от поддерживаемой версии.");
+            using(var bitmap=new Bitmap(width,height,PixelFormat.Format32bppArgb)) {
+                using(var g=Graphics.FromImage(bitmap)) {
+                    g.CompositingMode=CompositingMode.SourceCopy;g.DrawImageUnscaled(original,0,0);
+                    foreach(object item in (object[])definition["patches"]) {
+                        var patch=Obj(item);int x=Convert.ToInt32(patch["x"]),y=Convert.ToInt32(patch["y"]),w=Convert.ToInt32(patch["width"]),h=Convert.ToInt32(patch["height"]);
+                        if(x<0 || y<0 || w<=0 || h<=0 || x+w>width || y+h>height)throw new Exception("Подпись выходит за границы изображения.");
+                        using(var bytes=new MemoryStream(Convert.FromBase64String(Str(patch,"png"))))using(var overlay=Image.FromStream(bytes)) {
+                            if(overlay.Width!=w || overlay.Height!=h)throw new Exception("Неверный размер подписи.");
+                            g.DrawImageUnscaled(overlay,x,y);
+                        }
+                    }
+                }
+                using(var output=new MemoryStream()){bitmap.Save(output,ImageFormat.Png);return output.ToArray();}
+            }
+        }
+    }
     static byte[] PatchJar(byte[] input) {
         string hash=Hash(input);var known=((object[])Data["supported_mod_hashes"]).Cast<string>().ToArray();
         var maps=Obj(Data["classes"]);var expected=Strings(Data["entry_hashes"]);
+        var imagePatches=Data.ContainsKey("image_patches")?Obj(Data["image_patches"]):new Dictionary<string,object>();
         using(var original=new ZipArchive(new MemoryStream(input),ZipArchiveMode.Read)) {
             var marker=original.GetEntry(Marker);
             if(marker!=null) {
@@ -120,6 +145,7 @@ public static class OreboundRu {
             // Validate every original resource and executable class body before writing.
             foreach(var item in expected) {
                 var e=original.GetEntry(item.Key);if(e==null) throw new Exception("В моде отсутствует файл: "+item.Key);
+                if(marker!=null && imagePatches.ContainsKey(item.Key))continue;
                 var content=ReadEntry(e);if(item.Key.EndsWith(".class")) content=content.Skip(PoolEnd(content)).ToArray();
                 if(Hash(content)!=item.Value) throw new Exception("Код или ресурсы мода изменены: "+item.Key);
             }
@@ -129,6 +155,7 @@ public static class OreboundRu {
                         if(e.FullName=="assets/orebound/lang/ru_ru.json" || e.FullName==Marker) continue;
                         byte[] b=ReadEntry(e);
                         if(maps.ContainsKey(e.FullName)) b=PatchClass(b,Strings(maps[e.FullName]));
+                        if(imagePatches.ContainsKey(e.FullName)) b=PatchImage(b,Obj(imagePatches[e.FullName]));
                         var copy=output.CreateEntry(e.FullName,CompressionLevel.Optimal);copy.LastWriteTime=e.LastWriteTime;
                         using(var s=copy.Open()) s.Write(b,0,b.Length);
                     }
@@ -308,10 +335,10 @@ public static class OreboundRu {
                 if(args[0]=="--restore" && args.Length==3){Restore(args[1],args[2]);return 0;}
                 Console.WriteLine("OREBOUND-RU.exe --install <папка> [--no-worlds]\nOREBOUND-RU.exe --restore <папка> <резервная-копия>");return 2;
             }
-            var console=GetConsoleWindow();if(console!=IntPtr.Zero)ShowWindow(console,0);
+            var console=GetConsoleWindow();if(console!=IntPtr.Zero && GetConsoleProcessList(new uint[2],2)==1)ShowWindow(console,0);
             Application.EnableVisualStyles();
-            var form=new Form {Text="OREBOUND — русский перевод 1.1.0",Width=700,Height=370,StartPosition=FormStartPosition.CenterScreen,FormBorderStyle=FormBorderStyle.FixedDialog,MaximizeBox=false};
-            var label=new Label {Text="Выбери папку сборки OREBOUND 0.2.2. Перед установкой закрой Minecraft.",Left=15,Top=15,Width=655};
+            var form=new Form {Text="OREBOUND — русский перевод 1.2.0",Width=700,Height=370,StartPosition=FormStartPosition.CenterScreen,FormBorderStyle=FormBorderStyle.FixedDialog,MaximizeBox=false};
+            var label=new Label {Text="Выберите папку OREBOUND 0.2.2. Перед установкой закройте Minecraft.",Left=15,Top=15,Width=655};
             var path=new TextBox {Left=15,Top=44,Width=540};
             string standard=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),"curseforge","minecraft","Instances","OREBOUND - The World Below");if(Directory.Exists(standard))path.Text=standard;
             var browse=new Button {Text="Выбрать...",Left=565,Top=42,Width=100};
@@ -321,8 +348,8 @@ public static class OreboundRu {
             var restore=new Button {Text="Вернуть прежние файлы",Left=240,Top=115,Width=245,Height=32};
             var status=new TextBox {Left=15,Top=165,Width=650,Height=145,Multiline=true,ReadOnly=true,ScrollBars=ScrollBars.Vertical};
             Log=delegate(string s){status.AppendText(s+Environment.NewLine);};
-            install.Click+=delegate {try {install.Enabled=restore.Enabled=false;Install(path.Text,signs.Checked);Log("Запускай сборку через CurseForge. Новый мир создавать не нужно.");}catch(Exception e){MessageBox.Show(e.Message,"Установка остановлена",MessageBoxButtons.OK,MessageBoxIcon.Warning);}finally{install.Enabled=restore.Enabled=true;}};
-            restore.Click+=delegate {try {using(var d=new FolderBrowserDialog {Description="Выбери резервную копию из orebound-ru-backups",SelectedPath=Path.Combine(path.Text,"orebound-ru-backups")})if(d.ShowDialog()==DialogResult.OK)Restore(path.Text,d.SelectedPath);}catch(Exception e){MessageBox.Show(e.Message,"Откат остановлен",MessageBoxButtons.OK,MessageBoxIcon.Warning);}};
+            install.Click+=delegate {try {install.Enabled=restore.Enabled=false;Install(path.Text,signs.Checked);Log("Перевод установлен. Можно запускать сборку через CurseForge.");}catch(Exception e){MessageBox.Show(e.Message,"Установка остановлена",MessageBoxButtons.OK,MessageBoxIcon.Warning);}finally{install.Enabled=restore.Enabled=true;}};
+            restore.Click+=delegate {try {using(var d=new FolderBrowserDialog {Description="Выберите резервную копию из orebound-ru-backups",SelectedPath=Path.Combine(path.Text,"orebound-ru-backups")})if(d.ShowDialog()==DialogResult.OK)Restore(path.Text,d.SelectedPath);}catch(Exception e){MessageBox.Show(e.Message,"Откат остановлен",MessageBoxButtons.OK,MessageBoxIcon.Warning);}};
             form.Controls.AddRange(new Control[]{label,path,browse,signs,install,restore,status});Application.Run(form);return 0;
         } catch(Exception e) {Console.Error.WriteLine(e.Message);if(args.Length==0)MessageBox.Show(e.Message,"OREBOUND RU",MessageBoxButtons.OK,MessageBoxIcon.Error);return 1;}
     }

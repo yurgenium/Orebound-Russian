@@ -3,3 +3,5 @@
 *.log
 **/orebound-ru-backups/
 test-output/
+build/
+__pycache__/

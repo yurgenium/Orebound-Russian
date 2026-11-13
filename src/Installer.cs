@@ -131,7 +131,17 @@ public static class OreboundRu {
             }
         }
     }
-    static byte[] PatchJar(byte[] input) {
+    // An earlier install of this translator keeps the untouched jar in orebound-ru-backups/*/originals.
+    static byte[] OriginalFromBackups(string root,string rel) {
+        var known=((object[])Data["supported_mod_hashes"]).Cast<string>().ToArray();
+        string dir=Path.Combine(root,"orebound-ru-backups");if(!Directory.Exists(dir))return null;
+        foreach(string b in Directory.GetDirectories(dir).OrderByDescending(x=>x)) {
+            string p=Path.Combine(b,"originals",rel.Replace('/',Path.DirectorySeparatorChar));
+            if(!File.Exists(p))continue;var bytes=File.ReadAllBytes(p);if(known.Contains(Hash(bytes)))return bytes;
+        }
+        return null;
+    }
+    static byte[] PatchJar(byte[] input,byte[] fallback) {
         string hash=Hash(input);var known=((object[])Data["supported_mod_hashes"]).Cast<string>().ToArray();
         var maps=Obj(Data["classes"]);var expected=Strings(Data["entry_hashes"]);
         var imagePatches=Data.ContainsKey("image_patches")?Obj(Data["image_patches"]):new Dictionary<string,object>();
@@ -140,7 +150,8 @@ public static class OreboundRu {
             if(marker!=null) {
                 var meta=Obj(Json.DeserializeObject(Utf8.GetString(ReadEntry(marker))));
                 if(Str(meta,"payload_sha256")==PayloadHash) return input;
-                if(Str(meta,"original_sha256")!=Str(Data,"original_mod_sha256")) throw new Exception("Неподдерживаемая версия установленного перевода.");
+                if(fallback!=null) return PatchJar(fallback,null);
+                throw new Exception("В папке mods лежит мод с прежней версией перевода. Сначала верните оригинальный orebound-0.2.2.jar (кнопка «Вернуть прежние файлы» или переустановка сборки), затем повторите установку.");
             } else if(!known.Contains(hash)) throw new Exception("Мод OREBOUND отличается от поддерживаемой версии 0.2.2. Файлы не изменены.");
             // Validate every original resource and executable class body before writing.
             foreach(var item in expected) {
@@ -269,19 +280,28 @@ public static class OreboundRu {
         Directory.CreateDirectory(Path.GetDirectoryName(path));string temp=path+".orebound-ru-"+Guid.NewGuid().ToString("N")+".tmp";
         File.WriteAllBytes(temp,b);if(File.Exists(path))File.Replace(temp,path,null);else File.Move(temp,path);
     }
+    // Названия книг и страницы памятки в главе «Книги-руководства» заменяются по порядку следования,
+    // поэтому результат не зависит от того, какой перевод стоял в файле раньше.
+    static string PatchChapter(string text) {
+        var names=((object[])Data["chapter_names"]).Cast<string>().ToArray();var raws=((object[])Data["chapter_raws"]).Cast<string>().ToArray();
+        int n=0,r=0;
+        text=Regex.Replace(text,@"(""minecraft:custom_name"": )""(?:\\.|[^""\\])*""",delegate(Match m){int i=n++;return i<names.Length*2?m.Groups[1].Value+names[i/2]:m.Value;});
+        text=Regex.Replace(text,@"(\braw: )""(?:\\.|[^""\\])*""",delegate(Match m){int i=r++;return i<raws.Length?m.Groups[1].Value+raws[i]:m.Value;});
+        if(n!=names.Length*2 || r!=raws.Length) throw new Exception("Глава с книгами-руководствами отличается от поддерживаемой OREBOUND 0.2.2. Файлы не изменены.");
+        return text;
+    }
     static string Language(string text) {var m=Regex.Match(text,@"(?m)^lang:([^\r\n]*)");return m.Success?m.Groups[1].Value:null;}
     static string SetLanguage(string text,string lang) {return Regex.IsMatch(text,@"(?m)^lang:")?Regex.Replace(text,@"(?m)^lang:[^\r\n]*",delegate(Match m){return "lang:"+lang;}):text+(text.EndsWith("\n")?"":"\n")+"lang:"+lang+"\n";}
     public static string Install(string folder,bool signs) {
         Closed();string root=Base(folder),mod=FindMod(root),rel=mod.Substring(root.Length+1);var plan=new Dictionary<string,byte[]>(StringComparer.OrdinalIgnoreCase);
-        Put(plan,root,rel,PatchJar(File.ReadAllBytes(mod)));
+        Put(plan,root,rel,PatchJar(File.ReadAllBytes(mod),OriginalFromBackups(root,rel)));
         Put(plan,root,"config/ftbquests/quests/lang/ru_ru.snbt",Bytes("quest_language"));
         string dataPath="config/ftbquests/quests/data.snbt";
         string text=File.ReadAllText(SafePath(root,dataPath),Utf8);
         text=Regex.Replace(text,@"lock_message:\s*""(?:\\.|[^""\\])*""",delegate(Match m){return "lock_message: "+Json.Serialize(Str(Data,"lock_message"));});
         Put(plan,root,dataPath,Utf8.GetBytes(text));
         string chapter=Str(Data,"chapter_path");text=File.ReadAllText(SafePath(root,chapter),Utf8);
-        foreach(var item in Strings(Data["chapter_replacements"]))text=text.Replace(item.Key,item.Value);
-        Put(plan,root,chapter,Utf8.GetBytes(text));
+        Put(plan,root,chapter,Utf8.GetBytes(PatchChapter(text)));
         string opt=SafePath(root,"options.txt"),opts=File.Exists(opt)?File.ReadAllText(opt,Utf8):"";string oldLang=Language(opts);
         Put(plan,root,"options.txt",Utf8.GetBytes(SetLanguage(opts,"ru_ru")));
         if(signs)AddSigns(root,plan,Strings(Data["signs"]));
@@ -337,18 +357,19 @@ public static class OreboundRu {
             }
             var console=GetConsoleWindow();if(console!=IntPtr.Zero && GetConsoleProcessList(new uint[2],2)==1)ShowWindow(console,0);
             Application.EnableVisualStyles();
-            var form=new Form {Text="OREBOUND — русский перевод 1.2.0",Width=700,Height=370,StartPosition=FormStartPosition.CenterScreen,FormBorderStyle=FormBorderStyle.FixedDialog,MaximizeBox=false};
+            var form=new Form {Text="OREBOUND — русский перевод "+Str(Data,"version"),Width=700,Height=370,StartPosition=FormStartPosition.CenterScreen,FormBorderStyle=FormBorderStyle.FixedDialog,MaximizeBox=false};
             var label=new Label {Text="Выберите папку OREBOUND 0.2.2. Перед установкой закройте Minecraft.",Left=15,Top=15,Width=655};
             var path=new TextBox {Left=15,Top=44,Width=540};
             string standard=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),"curseforge","minecraft","Instances","OREBOUND - The World Below");if(Directory.Exists(standard))path.Text=standard;
+            string prism=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),"PrismLauncher","instances","OREBOUND - The World Below","minecraft");if(Directory.Exists(Path.Combine(prism,"mods")))path.Text=prism;
             var browse=new Button {Text="Выбрать...",Left=565,Top=42,Width=100};
-            browse.Click+=delegate {using(var d=new FolderBrowserDialog {Description="Папка сборки OREBOUND с папками mods и config",SelectedPath=path.Text})if(d.ShowDialog()==DialogResult.OK)path.Text=d.SelectedPath;};
+            browse.Click+=delegate {using(var d=new FolderBrowserDialog {Description="Игровая папка OREBOUND с папками mods и config (в Prism Launcher — вложенная папка minecraft)",SelectedPath=path.Text})if(d.ShowDialog()==DialogResult.OK)path.Text=d.SelectedPath;};
             var signs=new CheckBox {Text="Перевести стартовые таблички в существующих мирах",Left=15,Top=80,Width=650,Checked=true};
             var install=new Button {Text="Установить / обновить",Left=15,Top=115,Width=210,Height=32};
             var restore=new Button {Text="Вернуть прежние файлы",Left=240,Top=115,Width=245,Height=32};
             var status=new TextBox {Left=15,Top=165,Width=650,Height=145,Multiline=true,ReadOnly=true,ScrollBars=ScrollBars.Vertical};
             Log=delegate(string s){status.AppendText(s+Environment.NewLine);};
-            install.Click+=delegate {try {install.Enabled=restore.Enabled=false;Install(path.Text,signs.Checked);Log("Перевод установлен. Можно запускать сборку через CurseForge.");}catch(Exception e){MessageBox.Show(e.Message,"Установка остановлена",MessageBoxButtons.OK,MessageBoxIcon.Warning);}finally{install.Enabled=restore.Enabled=true;}};
+            install.Click+=delegate {try {install.Enabled=restore.Enabled=false;Install(path.Text,signs.Checked);Log("Готово. Можно запускать сборку.");}catch(Exception e){MessageBox.Show(e.Message,"Установка остановлена",MessageBoxButtons.OK,MessageBoxIcon.Warning);}finally{install.Enabled=restore.Enabled=true;}};
             restore.Click+=delegate {try {using(var d=new FolderBrowserDialog {Description="Выберите резервную копию из orebound-ru-backups",SelectedPath=Path.Combine(path.Text,"orebound-ru-backups")})if(d.ShowDialog()==DialogResult.OK)Restore(path.Text,d.SelectedPath);}catch(Exception e){MessageBox.Show(e.Message,"Откат остановлен",MessageBoxButtons.OK,MessageBoxIcon.Warning);}};
             form.Controls.AddRange(new Control[]{label,path,browse,signs,install,restore,status});Application.Run(form);return 0;
         } catch(Exception e) {Console.Error.WriteLine(e.Message);if(args.Length==0)MessageBox.Show(e.Message,"OREBOUND RU",MessageBoxButtons.OK,MessageBoxIcon.Error);return 1;}
